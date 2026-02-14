@@ -12,6 +12,7 @@ The executor:
 import asyncio
 import logging
 import warnings
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1713,7 +1714,9 @@ class GraphExecutor:
         Returns:
             Tuple of (branch_results dict, total_tokens, total_latency)
         """
+        base_snapshot = memory.read_all()
         branches: dict[str, ParallelBranch] = {}
+        branch_memories: dict[str, SharedMemory] = {}
 
         # Create branches for each edge
         for edge in edges:
@@ -1723,6 +1726,9 @@ class GraphExecutor:
                 node_id=edge.target,
                 edge=edge,
             )
+            # Isolate branch memory to avoid non-deterministic cross-branch writes.
+            # Branch nodes execute against their own copy; we merge diffs deterministically after.
+            branch_memories[branch_id] = SharedMemory(_data=dict(base_snapshot))
 
         self.logger.info(f"   ⑂ Fan-out: executing {len(branches)} branches in parallel")
         for branch in branches.values():
@@ -1733,6 +1739,7 @@ class GraphExecutor:
             branch: ParallelBranch,
         ) -> tuple[ParallelBranch, NodeResult | Exception]:
             """Execute a single branch with retry logic."""
+            branch_memory = branch_memories[branch.branch_id]
             node_spec = graph.get_node(branch.node_id)
             if node_spec is None:
                 branch.status = "failed"
@@ -1756,7 +1763,7 @@ class GraphExecutor:
                 # Use full memory state since target input_keys may come
                 # from earlier nodes, not just the immediate source.
                 if self.cleansing_config.enabled and node_spec:
-                    mem_snapshot = memory.read_all()
+                    mem_snapshot = branch_memory.read_all()
                     validation = self.output_cleaner.validate_output(
                         output=mem_snapshot,
                         source_node_id=source_node_spec.id if source_node_spec else "unknown",
@@ -1776,12 +1783,12 @@ class GraphExecutor:
                         )
                         # Write cleaned output to memory
                         for key, value in cleaned_output.items():
-                            await memory.write_async(key, value)
+                            await branch_memory.write_async(key, value)
 
                 # Map inputs via edge
-                mapped = branch.edge.map_inputs(source_result.output, memory.read_all())
+                mapped = branch.edge.map_inputs(source_result.output, branch_memory.read_all())
                 for key, value in mapped.items():
-                    await memory.write_async(key, value)
+                    await branch_memory.write_async(key, value)
 
                 # Execute with retries
                 last_result = None
@@ -1789,7 +1796,9 @@ class GraphExecutor:
                     branch.retry_count = attempt
 
                     # Build context for this branch
-                    ctx = self._build_context(node_spec, memory, goal, mapped, graph.max_tokens)
+                    ctx = self._build_context(
+                        node_spec, branch_memory, goal, mapped, graph.max_tokens
+                    )
                     node_impl = self._get_node_implementation(node_spec, graph.cleanup_llm_model)
 
                     # Emit node-started event (skip event_loop nodes)
@@ -1825,7 +1834,7 @@ class GraphExecutor:
                     if result.success:
                         # Write outputs to shared memory using async write
                         for key, value in result.output.items():
-                            await memory.write_async(key, value)
+                            await branch_memory.write_async(key, value)
 
                         branch.result = result
                         branch.status = "completed"
@@ -1893,7 +1902,7 @@ class GraphExecutor:
                 total_latency += result.latency_ms
                 branch_results[branch.branch_id] = result
 
-        # Handle failures based on config
+        # Handle failures based on config before merging any branch state.
         if failed_branches:
             failed_names = [graph.get_node(b.node_id).name for b in failed_branches]
             if self._parallel_config.on_branch_failure == "fail_all":
@@ -1902,6 +1911,47 @@ class GraphExecutor:
                 self.logger.warning(
                     f"⚠ Some branches failed ({failed_names}), continuing with successful ones"
                 )
+
+        # Merge branch memory diffs deterministically.
+        successful_branch_ids = set(branch_results.keys())
+        branch_changes: dict[str, dict[str, Any]] = {}
+        missing = object()
+        for branch_id, branch_memory in branch_memories.items():
+            if branch_id not in successful_branch_ids:
+                continue
+            snapshot = branch_memory.read_all()
+            changes = {}
+            for key, value in snapshot.items():
+                if base_snapshot.get(key, missing) != value:
+                    changes[key] = value
+            if changes:
+                branch_changes[branch_id] = changes
+
+        conflicts: dict[str, list[str]] = defaultdict(list)
+        values_seen: dict[str, Any] = {}
+        for branch_id, changes in branch_changes.items():
+            for key, value in changes.items():
+                if key in values_seen and values_seen[key] != value:
+                    conflicts[key].append(branch_id)
+                else:
+                    values_seen.setdefault(key, value)
+
+        if conflicts and self._parallel_config.memory_conflict_strategy == "error":
+            keys = sorted(conflicts.keys())
+            raise RuntimeError(
+                "Parallel memory merge conflict (strategy=error): " + ", ".join(keys)
+            )
+
+        merge_order = list(branches.keys())  # Deterministic: same order as edges passed in.
+        applied_keys: set[str] = set()
+        for branch_id in merge_order:
+            changes = branch_changes.get(branch_id, {})
+            for key, value in changes.items():
+                if self._parallel_config.memory_conflict_strategy == "first_wins":
+                    if key in applied_keys:
+                        continue
+                    applied_keys.add(key)
+                await memory.write_async(key, value)
 
         self.logger.info(
             f"   ⑃ Fan-out complete: {len(branch_results)}/{len(branches)} branches succeeded"

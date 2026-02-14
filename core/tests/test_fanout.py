@@ -387,7 +387,89 @@ async def test_per_branch_retry(runtime, goal):
     assert flaky.attempt_count == 4  # 3 fails + 1 success
 
 
-# === 8. Single-edge path unaffected ===
+# === 8. Memory conflict strategies ===
+
+
+@pytest.mark.asyncio
+async def test_memory_conflict_last_wins_is_deterministic(runtime, goal):
+    """last_wins should deterministically pick the later branch by edge order."""
+    b1 = NodeSpec(
+        id="b1", name="B1", description="branch 1", node_type="function", output_keys=["k"]
+    )
+    b2 = NodeSpec(
+        id="b2", name="B2", description="branch 2", node_type="function", output_keys=["k"]
+    )
+
+    graph = _make_fanout_graph([b1, b2])
+
+    config = ParallelExecutionConfig(memory_conflict_strategy="last_wins")
+    executor = GraphExecutor(
+        runtime=runtime, enable_parallel_execution=True, parallel_config=config
+    )
+    executor.register_node("source", SuccessNode({"data": "x"}))
+    executor.register_node("b1", SuccessNode({"k": "b1"}))
+    executor.register_node("b2", SuccessNode({"k": "b2"}))
+
+    result = await executor.execute(graph, goal, {})
+
+    assert result.success
+    assert result.output["k"] == "b2"
+
+
+@pytest.mark.asyncio
+async def test_memory_conflict_first_wins(runtime, goal):
+    """first_wins should keep the earlier branch value by edge order."""
+    b1 = NodeSpec(
+        id="b1", name="B1", description="branch 1", node_type="function", output_keys=["k"]
+    )
+    b2 = NodeSpec(
+        id="b2", name="B2", description="branch 2", node_type="function", output_keys=["k"]
+    )
+
+    graph = _make_fanout_graph([b1, b2])
+
+    config = ParallelExecutionConfig(memory_conflict_strategy="first_wins")
+    executor = GraphExecutor(
+        runtime=runtime, enable_parallel_execution=True, parallel_config=config
+    )
+    executor.register_node("source", SuccessNode({"data": "x"}))
+    executor.register_node("b1", SuccessNode({"k": "b1"}))
+    executor.register_node("b2", SuccessNode({"k": "b2"}))
+
+    result = await executor.execute(graph, goal, {})
+
+    assert result.success
+    assert result.output["k"] == "b1"
+
+
+@pytest.mark.asyncio
+async def test_memory_conflict_error_raises(runtime, goal):
+    """error strategy should fail when branches write different values to the same key."""
+    b1 = NodeSpec(
+        id="b1", name="B1", description="branch 1", node_type="function", output_keys=["k"]
+    )
+    b2 = NodeSpec(
+        id="b2", name="B2", description="branch 2", node_type="function", output_keys=["k"]
+    )
+
+    graph = _make_fanout_graph([b1, b2])
+
+    config = ParallelExecutionConfig(memory_conflict_strategy="error")
+    executor = GraphExecutor(
+        runtime=runtime, enable_parallel_execution=True, parallel_config=config
+    )
+    executor.register_node("source", SuccessNode({"data": "x"}))
+    executor.register_node("b1", SuccessNode({"k": "b1"}))
+    executor.register_node("b2", SuccessNode({"k": "b2"}))
+
+    result = await executor.execute(graph, goal, {})
+    assert not result.success
+    assert result.error is not None
+    assert "conflict" in result.error.lower()
+    assert "k" in result.error
+
+
+# === 9. Single-edge path unaffected ===
 
 
 @pytest.mark.asyncio
@@ -427,7 +509,7 @@ async def test_single_edge_no_parallel_overhead(runtime, goal):
     assert result.path == ["n1", "n2"]
 
 
-# === 9. detect_fan_out_nodes static analysis ===
+# === 10. detect_fan_out_nodes static analysis ===
 
 
 def test_detect_fan_out_nodes():
@@ -442,7 +524,7 @@ def test_detect_fan_out_nodes():
     assert set(fan_outs["source"]) == {"b1", "b2"}
 
 
-# === 10. detect_fan_in_nodes static analysis ===
+# === 11. detect_fan_in_nodes static analysis ===
 
 
 def test_detect_fan_in_nodes():
@@ -460,7 +542,7 @@ def test_detect_fan_in_nodes():
     assert set(fan_ins["merge"]) == {"b1", "b2"}
 
 
-# === 11. Parallel disabled falls back to sequential ===
+# === 12. Parallel disabled falls back to sequential ===
 
 
 @pytest.mark.asyncio
